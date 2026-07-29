@@ -7,7 +7,7 @@ from ultralytics import YOLO
 # KONFIGURASI MODEL
 # ==========================================
 # Ubah dengan lokasi file best.pt yang sudah Anda download dari Google Drive/Colab
-MODEL_PATH = "/home/an/lab-detection/02a.0bb-versi-ket-jarak-tube-hidung/train_obbv_tube_nose_distance/weights/best.pt" 
+MODEL_PATH = "/home/an/irpa-asesment/2-keter-jarak-tabung-hidung/train_nose_tube_seg_baseline/weights/best.pt" 
 CONFIDENCE_THRESHOLD = 0.5  # Hanya tampilkan deteksi dengan akurasi di atas 50%
 
 def main():
@@ -75,7 +75,7 @@ def main():
                     cx = int((x1 + x2) / 2)
                     cy = int((y1 + y2) / 2)
                     noses.append((cx, cy))
-                elif "tube" in name:
+                elif "tube" in name or "pipette" in name or "pipet" in name:
                     # Asumsi: Mulut tabung adalah bagian tengah tepi atas (y1)
                     mouth_x = int((x1 + x2) / 2)
                     mouth_y = int(y1)
