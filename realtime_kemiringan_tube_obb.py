@@ -1,132 +1,179 @@
 import cv2
-import math
 import time
+import math
+import numpy as np
 from ultralytics import YOLO
-import os
 
-# Simplified angle-only OBB detector for tube tilt measurement
-MODEL_PATH = "weights/best.pt"
-CONFIDENCE = 0.5
-ANGLE_TOLERANCE_SEJAJAR = 5.0   # degrees
-ANGLE_TOLERANCE_AGAK = 15.0    # degrees
+# ==========================================
+# KONFIGURASI MODEL
+# ==========================================
+# Ubah dengan lokasi file best.pt yang sudah Anda download dari Google Drive/Colab
+MODEL_PATH = "/home/an/irpa-asesment/1-keter-pemanasan-tabung/train_tube_flame_seg_baseline/weights/best.pt" 
+CONFIDENCE_THRESHOLD = 0.5  # Hanya tampilkan deteksi dengan akurasi di atas 50%
 
-TUBE_CLASS_NAME = "tube"
-FLAME_CLASS_NAME = "flame"
+def main():
+    print(f"Mencoba memuat model dari: {MODEL_PATH}")
+    
+    try:
+        model = YOLO(MODEL_PATH)
+        print("Model berhasil dimuat!")
+    except Exception as e:
+        print(f"Error memuat model: {e}")
+        print("Pastikan file model sudah didownload ke laptop Anda dan ditaruh di folder/path yang tepat.")
+        return
 
+    # Buka Webcam (0 adalah webcam bawaan laptop, bisa dicoba 1, 2, dst jika pakai eksternal)
+    cap = cv2.VideoCapture(0)
+    
+    if not cap.isOpened():
+        print("Error: Tidak dapat membuka webcam. Pastikan tidak ada aplikasi lain yang sedang memakainya.")
+        return
 
-def normalize_angle_deg(angle_deg: float) -> float:
-    """Normalize angle to range [-90, 90]."""
-    a = (angle_deg + 180) % 360 - 180
-    if a > 90:
-        a -= 180
-    if a < -90:
-        a += 180
-    return a
+    # Atur resolusi streaming webcam
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-
-def classify_tilt(angle_deg: float):
-    """Classify tilt level relative to vertical axis (90°)."""
-    tilt_from_vertical = abs(abs(angle_deg) - 90.0)
-    if tilt_from_vertical <= ANGLE_TOLERANCE_SEJAJAR:
-        return "TEGAK", (0, 255, 0)
-    if tilt_from_vertical <= ANGLE_TOLERANCE_AGAK:
-        return "AGAK MIRING", (0, 255, 255)
-    return "MIRING", (0, 0, 255)
-
-
-print(f"Loading model: {MODEL_PATH}")
-if not os.path.exists(MODEL_PATH):
-    # try find
-    for root, dirs, files in os.walk('.'):
-        for f in files:
-            if f == 'best.pt':
-                MODEL_PATH = os.path.join(root, f)
-                print(f"Found model at: {MODEL_PATH}")
-                break
-        if os.path.exists(MODEL_PATH):
-            break
-
-model = YOLO(MODEL_PATH)
-
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    raise RuntimeError('Webcam cannot be opened')
-
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-prev_time = 0
-
-print('\n=== Tube / Flame Angle Detection ===')
-print("Press 'q' to quit")
-
-try:
+    print("\n=====================================")
+    print("Memulai Realtime Inference...")
+    print("Tekan tombol 'q' pada keyboard untuk keluar.")
+    print("=====================================\n")
+    
+    prev_time = 0
+    
     while True:
         ret, frame = cap.read()
         if not ret:
+            print("Gagal membaca frame dari webcam.")
             break
+            
+        # Hitung FPS
+        current_time = time.time()
+        fps = 1 / (current_time - prev_time) if prev_time > 0 else 0
+        prev_time = current_time
 
-        t0 = time.time()
-        results = model(frame, conf=CONFIDENCE, imgsz=640, verbose=False)
+        # Jalankan inference
+        results = model.predict(frame, conf=CONFIDENCE_THRESHOLD, verbose=False)
         result = results[0]
-        annotated = result.plot()
+        
+        # results[0].plot() akan otomatis menggambar kotak/poligon dan nama kelasnya
+        annotated_frame = result.plot()
 
-        tube_found = False
-        if getattr(result, 'obb', None) is not None:
-            xywhr = result.obb.xywhr.cpu().numpy()
-            cls_ids = result.obb.cls.cpu().numpy().astype(int)
-            names = result.names
+        # Ekstrak data untuk perhitungan jarak hidung ke mulut tabung
+        class_names = result.names
+        noses = []
+        tubes = []
+        
+        if result.boxes is not None:
+            boxes = result.boxes.xyxy.cpu().numpy()
+            classes = result.boxes.cls.cpu().numpy()
+            masks = result.masks.xy if hasattr(result, 'masks') and result.masks is not None else [None] * len(boxes)
+            
+            for box, cls_id, mask in zip(boxes, classes, masks):
+                name = class_names[int(cls_id)].lower()
+                x1, y1, x2, y2 = box
+                
+                if "nose" in name:
+                    # Titik tengah hidung
+                    cx = int((x1 + x2) / 2)
+                    cy = int((y1 + y2) / 2)
+                    noses.append((cx, cy))
+                elif "tube" in name:
+                    # Asumsi: Mulut tabung adalah bagian tengah tepi atas (y1)
+                    mouth_x = int((x1 + x2) / 2)
+                    mouth_y = int(y1)
+                    # Perkiraan panjang tabung dalam piksel (panjang diagonal/sisi terpanjang)
+                    tube_length_px = max(x2 - x1, y2 - y1)
+                    tubes.append((mouth_x, mouth_y, tube_length_px))
+                    
+                    # Deteksi kemiringan (angle) menggunakan polygon mask
+                    if mask is not None and len(mask) >= 5:
+                        pts = np.array(mask, dtype=np.float32)
+                        rect = cv2.minAreaRect(pts)
+                        (cx, cy), (w, h), angle = rect
+                        
+                        # Penyesuaian sudut agar 0 derajat berarti vertikal
+                        if w < h:
+                            tilt_angle = angle
+                        else:
+                            tilt_angle = angle - 90
+                            
+                        # Gambar bounding box (oriented) dari mask
+                        box_pts = cv2.boxPoints(rect)
+                        box_pts = np.int32(box_pts)
+                        cv2.drawContours(annotated_frame, [box_pts], 0, (255, 0, 255), 2)
+                        
+                        # Tampilkan teks kemiringan (warna magenta)
+                        text_x = max(10, int(x1))
+                        text_y = max(30, int(y1) - 10)
+                        cv2.putText(annotated_frame, f"Kemiringan: {tilt_angle:.1f} deg", (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
-            for i, det in enumerate(xywhr):
-                x, y, w, h, angle = det
-                cid = int(cls_ids[i])
-                cname = str(names.get(cid, '')).lower()
+        # Logika Peringatan
+        warning_triggered = False
+        
+        for tx, ty, tube_length_px in tubes:
+            # Gambar titik biru di posisi mulut tabung
+            cv2.circle(annotated_frame, (tx, ty), 6, (255, 0, 0), -1) 
+            
+            # Hitung rasio piksel ke cm (Acuan: panjang tabung = 15 cm)
+            cm_per_pixel = 15.0 / tube_length_px if tube_length_px > 0 else 0
+            
+            for nx, ny in noses:
+                # Gambar titik tengah hidung
+                cv2.circle(annotated_frame, (nx, ny), 6, (0, 165, 255), -1) 
+                
+                # Hitung jarak piksel
+                dist_px = math.hypot(tx - nx, ty - ny)
+                
+                # Konversi jarak ke centimeter
+                dist_cm = dist_px * cm_per_pixel
+                
+                # Gambar garis penghubung kuning
+                cv2.line(annotated_frame, (tx, ty), (nx, ny), (0, 255, 255), 2)
+                
+                # Tuliskan teks jarak dalam satuan cm di tengah-tengah garis
+                mid_x = int((tx + nx) / 2)
+                mid_y = int((ty + ny) / 2)
+                cv2.putText(annotated_frame, f"{dist_cm:.1f} cm", (mid_x, mid_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                
+                # Jika jaraknya kurang dari 10 cm
+                if dist_cm < 10.0:
+                    warning_triggered = True
 
-                if cname not in {TUBE_CLASS_NAME, FLAME_CLASS_NAME}:
-                    continue
+        # Tampilkan teks peringatan jika terlalu dekat
+        if warning_triggered:
+            cv2.putText(
+                annotated_frame,
+                "BAHAYA: MULUT TABUNG DEKAT HIDUNG!",
+                (20, 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 0, 255), # Warna Merah
+                3
+            )
 
-                angle_deg = normalize_angle_deg(math.degrees(angle))
-                status, color = classify_tilt(angle_deg)
-                display_name = cname.title()
-                label_text = f"{display_name}: {angle_deg:.1f}°"
+        # Tampilkan FPS di pojok kiri atas
+        cv2.putText(
+            annotated_frame,
+            f"FPS: {fps:.1f}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0), # Warna Hijau
+            2
+        )
 
-                cv2.putText(
-                    annotated,
-                    label_text,
-                    (int(x), int(y)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    color,
-                    2,
-                )
-                cv2.putText(
-                    annotated,
-                    status,
-                    (int(x), int(y) + 24),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    color,
-                    2,
-                )
+        # Tampilkan Window Preview
+        cv2.imshow("YOLO Realtime Stream", annotated_frame)
 
-                if cname == TUBE_CLASS_NAME:
-                    tube_found = True
-
-        if not tube_found:
-            cv2.putText(annotated, 'TUBE TIDAK TERDETEKSI', (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
-
-        fps = 1.0 / max(1e-6, time.time() - prev_time) if prev_time > 0 else 0.0
-        prev_time = time.time()
-        cv2.putText(annotated, f"FPS: {fps:.1f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
-
-        cv2.imshow('Tube Tilt (OBB)', annotated)
+        # Tunggu input tombol keyboard selama 1ms
+        # Keluar jika tombol 'q' ditekan
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-except KeyboardInterrupt:
-    pass
-
-finally:
+    # Bersihkan resource (Matikan webcam dan tutup jendela)
     cap.release()
     cv2.destroyAllWindows()
+    print("Program selesai.")
 
+if __name__ == "__main__":
+    main()
